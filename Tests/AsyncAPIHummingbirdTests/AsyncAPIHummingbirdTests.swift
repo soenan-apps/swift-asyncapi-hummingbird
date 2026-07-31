@@ -318,8 +318,164 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
     XCTAssertTrue(cancelled)
   }
 
-  func testOutboundWritesAreBoundedAndCancellationAware() async throws {
+  func testInboundByteBudgetOverflowClosesConnectionAndCancelsHandler() async throws {
+    let router = Router(context: BasicWebSocketRequestContext.self)
+    let recorder = CancellationRecorder()
+    let configuration = try XCTUnwrap(
+      AsyncAPIHummingbirdConfiguration(
+        maximumMessageSize: 1_024,
+        inboundMessageBufferCapacity: 2,
+        outboundWriteBufferCapacity: 1,
+        maximumBufferedBytesPerConnection: 5
+      )
+    )
+    let transport = HummingbirdWebSocketTransport(
+      router: router,
+      configuration: configuration
+    )
+    try transport.register(
+      channel: AsyncAPIChannel(
+        name: "events",
+        address: "/events",
+        parameterNames: []
+      )
+    ) { _ in
+      try await withTaskCancellationHandler {
+        try await Task.sleep(for: .seconds(60))
+      } onCancel: {
+        Task { await recorder.recordCancellation() }
+      }
+    }
+
+    let app = Application(
+      router: Router(),
+      server: .http1WebSocketUpgrade(
+        webSocketRouter: router,
+        configuration: .init(validateUTF8: true)
+      )
+    )
+    try await app.test(.live) { client in
+      let close = try await client.ws("/events") { inbound, outbound, _ in
+        try await outbound.write(.text("one"))
+        try await outbound.write(.text("two"))
+        for try await _ in inbound {}
+      }
+      XCTAssertEqual(close?.closeCode, .unexpectedServerError)
+    }
+
+    let cancelled = await recorder.cancelled
+    XCTAssertTrue(cancelled)
+  }
+
+  func testConfigurationIncludesAPositiveConnectionByteBudget() throws {
+    XCTAssertEqual(
+      AsyncAPIHummingbirdConfiguration.default
+        .maximumBufferedBytesPerConnection,
+      1 << 20
+    )
+    XCTAssertNotNil(
+      AsyncAPIHummingbirdConfiguration(
+        maximumMessageSize: 32,
+        inboundMessageBufferCapacity: 2,
+        outboundWriteBufferCapacity: 3
+      )
+    )
+    XCTAssertNil(
+      AsyncAPIHummingbirdConfiguration(
+        maximumBufferedBytesPerConnection: 0
+      )
+    )
+  }
+
+  func testByteBudgetMatchesASeededReferenceModelWithoutIntegerOverflow() {
+    var randomState: UInt64 = 0x5eed_cafe_f00d_beef
+    func nextRandom() -> UInt64 {
+      randomState = randomState &* 6_364_136_223_846_793_005 &+ 1
+      return randomState
+    }
+
+    for limit in [1, 7, 1_024, Int.max] {
+      let budget = HummingbirdConnectionByteBudget(limit: limit)
+      var modelReservedBytes = 0
+      var reservations: [Int] = []
+
+      for _ in 0..<4_096 {
+        if !reservations.isEmpty && nextRandom().isMultiple(of: 4) {
+          let index = Int(nextRandom() % UInt64(reservations.count))
+          let byteCount = reservations.remove(at: index)
+          budget.release(byteCount)
+          modelReservedBytes -= byteCount
+        } else {
+          let candidates = [
+            0,
+            1,
+            min(2, limit),
+            limit,
+            limit - modelReservedBytes,
+            modelReservedBytes,
+          ]
+          let byteCount = candidates[
+            Int(nextRandom() % UInt64(candidates.count))
+          ]
+          let expected = byteCount <= limit - modelReservedBytes
+          XCTAssertEqual(budget.reserve(byteCount), expected)
+          if expected {
+            modelReservedBytes += byteCount
+            reservations.append(byteCount)
+          }
+        }
+        XCTAssertEqual(budget.reservedByteCount, modelReservedBytes)
+      }
+
+      for byteCount in reservations {
+        budget.release(byteCount)
+      }
+      XCTAssertEqual(budget.reservedByteCount, 0)
+    }
+  }
+
+  func testInboundBufferReleasesBytesOnDequeueAndTerminalCleanup() async throws {
+    let byteBudget = HummingbirdConnectionByteBudget(limit: 5)
+    let buffer = BoundedHummingbirdInboundMessageBuffer(
+      capacity: 2,
+      byteBudget: byteBudget
+    )
+
+    let firstEnqueue = await buffer.enqueue(.text("one"), byteCount: 3)
+    XCTAssertEqual(firstEnqueue, .enqueued)
+    let secondEnqueue = await buffer.enqueue(.binary([1, 2]), byteCount: 2)
+    XCTAssertEqual(secondEnqueue, .enqueued)
+    XCTAssertEqual(byteBudget.reservedByteCount, 5)
+    let countOverflow = await buffer.enqueue(
+      .text("overflow"),
+      byteCount: 1
+    )
+    XCTAssertEqual(countOverflow, .countOverflow)
+    XCTAssertEqual(byteBudget.reservedByteCount, 5)
+
+    let firstMessage = try await buffer.next()
+    XCTAssertEqual(firstMessage, .text("one"))
+    XCTAssertEqual(byteBudget.reservedByteCount, 2)
+    let byteOverflow = await buffer.enqueue(
+      .text("toolarge"),
+      byteCount: 4
+    )
+    XCTAssertEqual(byteOverflow, .byteOverflow)
+    XCTAssertEqual(byteBudget.reservedByteCount, 2)
+
+    await buffer.finish()
+    XCTAssertEqual(byteBudget.reservedByteCount, 0)
+    let terminalMessage = try await buffer.next()
+    XCTAssertNil(terminalMessage)
+  }
+
+  func testInboundAndOutboundQueuesShareOneConnectionByteBudget() async throws {
     let sink = SuspendedSink()
+    let byteBudget = HummingbirdConnectionByteBudget(limit: 5)
+    let inboundBuffer = BoundedHummingbirdInboundMessageBuffer(
+      capacity: 2,
+      byteBudget: byteBudget
+    )
     let writer = BoundedHummingbirdWebSocketWriter(
       sink: HummingbirdWebSocketSink(
         writeText: { try await sink.write($0) },
@@ -327,7 +483,44 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
         close: { _ in }
       ),
       maximumMessageSize: 16,
-      bufferCapacity: 1
+      bufferCapacity: 2,
+      byteBudget: byteBudget
+    )
+
+    let inboundEnqueue = await inboundBuffer.enqueue(
+      .text("abc"),
+      byteCount: 3
+    )
+    XCTAssertEqual(inboundEnqueue, .enqueued)
+    let activeWrite = Task { try await writer.send(.text("active")) }
+    await sink.waitUntilWriting()
+
+    do {
+      try await writer.send(.text("xyz"))
+      XCTFail("the combined inbound and outbound queues should exceed 5 bytes")
+    } catch let error as AsyncAPIHummingbirdError {
+      XCTAssertEqual(error, .connectionBufferOverflow(limit: 5))
+    }
+    XCTAssertEqual(byteBudget.reservedByteCount, 3)
+
+    await inboundBuffer.finish()
+    XCTAssertEqual(byteBudget.reservedByteCount, 0)
+    await sink.resumeWrites()
+    try await activeWrite.value
+  }
+
+  func testOutboundWritesAreBoundedAndCancellationAware() async throws {
+    let sink = SuspendedSink()
+    let byteBudget = HummingbirdConnectionByteBudget(limit: 16)
+    let writer = BoundedHummingbirdWebSocketWriter(
+      sink: HummingbirdWebSocketSink(
+        writeText: { try await sink.write($0) },
+        writeBinary: { _ in },
+        close: { _ in }
+      ),
+      maximumMessageSize: 16,
+      bufferCapacity: 1,
+      byteBudget: byteBudget
     )
 
     let first = Task { try await writer.send(.text("first")) }
@@ -339,6 +532,7 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
     }
     let pendingWriteCount = await writer.pendingWriteCount()
     XCTAssertEqual(pendingWriteCount, 1)
+    XCTAssertEqual(byteBudget.reservedByteCount, 6)
 
     do {
       try await writer.send(.text("third"))
@@ -348,6 +542,13 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
     }
 
     second.cancel()
+    for _ in 0..<100 {
+      guard await writer.pendingWriteCount() != 0 else { break }
+      await Task.yield()
+    }
+    let remainingWriteCount = await writer.pendingWriteCount()
+    XCTAssertEqual(remainingWriteCount, 0)
+    XCTAssertEqual(byteBudget.reservedByteCount, 0)
     await sink.resumeWrites()
     try await first.value
     do {
@@ -356,6 +557,44 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
     } catch is CancellationError {}
     let writtenValues = await sink.values
     XCTAssertEqual(writtenValues, ["first"])
+  }
+
+  func testWriterTerminalCleanupReleasesEveryQueuedReservation() async throws {
+    let sink = SuspendedSink()
+    let byteBudget = HummingbirdConnectionByteBudget(limit: 16)
+    let writer = BoundedHummingbirdWebSocketWriter(
+      sink: HummingbirdWebSocketSink(
+        writeText: { try await sink.write($0) },
+        writeBinary: { _ in },
+        close: { _ in }
+      ),
+      maximumMessageSize: 16,
+      bufferCapacity: 2,
+      byteBudget: byteBudget
+    )
+
+    let activeWrite = Task { try await writer.send(.text("active")) }
+    await sink.waitUntilWriting()
+    let queuedWrite = Task { try await writer.send(.text("queued")) }
+    for _ in 0..<100 {
+      guard await writer.pendingWriteCount() == 0 else { break }
+      await Task.yield()
+    }
+    let pendingWriteCount = await writer.pendingWriteCount()
+    XCTAssertEqual(pendingWriteCount, 1)
+    XCTAssertEqual(byteBudget.reservedByteCount, 6)
+
+    await writer.finish()
+    XCTAssertEqual(byteBudget.reservedByteCount, 0)
+    do {
+      try await queuedWrite.value
+      XCTFail("terminal cleanup should fail an accepted queued write")
+    } catch let error as AsyncAPIHummingbirdError {
+      XCTAssertEqual(error, .connectionClosed)
+    }
+
+    await sink.resumeWrites()
+    try await activeWrite.value
   }
 
   func testCloseWaitsForAcceptedWritesAndRejectsNewWrites() async throws {
@@ -367,7 +606,8 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
         close: { await sink.close($0) }
       ),
       maximumMessageSize: 16,
-      bufferCapacity: 1
+      bufferCapacity: 1,
+      byteBudget: HummingbirdConnectionByteBudget(limit: 16)
     )
     let signal = try AsyncAPICloseSignal(
       code: .serviceRestart,
@@ -406,7 +646,8 @@ final class AsyncAPIHummingbirdTests: XCTestCase {
         close: { _ in }
       ),
       maximumMessageSize: 3,
-      bufferCapacity: 1
+      bufferCapacity: 1,
+      byteBudget: HummingbirdConnectionByteBudget(limit: 16)
     )
 
     do {

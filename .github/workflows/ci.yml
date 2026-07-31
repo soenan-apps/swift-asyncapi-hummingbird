@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Swift 6.3.3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: swift:6.3.3-bookworm@sha256:eefe3757e5e9b760628212943c3b5c7c7e3e7e5b9cf549bedb547689e6ef0b4c
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify Swift version
+        run: swift --version | grep -F "Swift version 6.3.3"
+
+      - name: Resolve dependency graph
+        run: |
+          swift package resolve
+          test -s Package.resolved
+
+      - name: Lint formatting
+        run: swift format lint --strict --recursive Sources Tests
+
+      - name: Test resolved dependency graph
+        run: swift test --jobs 2 --force-resolved-versions

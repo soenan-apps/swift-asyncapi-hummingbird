@@ -150,10 +150,12 @@ beyond the generated channel contract remain application responsibilities.
 | `maximumMessageSize` | 1 MiB | Bounds inbound messages through Hummingbird and outbound messages by byte count. |
 | `inboundMessageBufferCapacity` | 16 | Buffers complete messages. Overflow terminates the stream with `inboundBufferOverflow` and cancels the handler. |
 | `outboundWriteBufferCapacity` | 16 | Bounds writes waiting behind the active write. Overflow rejects the new write with `outboundBufferOverflow`. |
+| `maximumBufferedBytesPerConnection` | 1 MiB | Bounds the combined bytes queued by inbound messages and outbound writes. Overflow terminates or rejects with `connectionBufferOverflow`. |
 
 All values must be greater than zero. Text size is measured in UTF-8 bytes.
 The outbound writer accepts one active write plus the configured number of
-waiting writes.
+waiting writes. The byte budget counts queued data, releases reservations when
+data leaves a queue, and is shared by both directions for the connection.
 
 When close begins, new sends fail with `connectionClosed`; already accepted
 writes complete in order before the close frame. A write failure closes the
