@@ -185,10 +185,6 @@ actor BoundedHummingbirdInboundMessageBuffer {
     }
   }
 
-  func bufferedMessageCount() -> Int {
-    messages.count
-  }
-
   private func cancelWaiter(id: UInt64) {
     guard let index = waiters.firstIndex(where: { $0.id == id }) else {
       return
